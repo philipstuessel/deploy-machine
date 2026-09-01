@@ -1,0 +1,49 @@
+{
+  "vars": {
+    "host": "203.0.113.10",
+    "user": "deploy",
+    "ssh_key_file": "~/.ssh/deploy_key",
+    "deploy_path": "/srv/app",
+    "source": "dist",
+    "keep_releases": "5"
+  },
+  "steps": [
+    {
+      "name": "Lint",
+      "type": "run",
+      "on": "local",
+      "cmd": "npm run lint"
+    },
+    {
+      "name": "Test",
+      "type": "run",
+      "on": "local",
+      "cmd": "npm test"
+    },
+    {
+      "name": "Build",
+      "type": "run",
+      "on": "local",
+      "cmd": "npm run build"
+    },
+    {
+      "name": "Upload release",
+      "type": "upload",
+      "from": "{{source}}/",
+      "to": "{{release_path}}/",
+      "delete": true
+    },
+    {
+      "name": "Activate release",
+      "type": "symlink",
+      "target": "{{release_path}}",
+      "link": "{{current_link}}"
+    },
+    {
+      "name": "Remove old releases",
+      "type": "cleanup",
+      "keep": "{{keep_releases}}",
+      "allow_failure": true
+    }
+  ]
+}
