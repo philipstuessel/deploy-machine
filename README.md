@@ -145,5 +145,9 @@ trying things out.
 **Every setting** is in `--help`. There are more than shown here, but you rarely
 need them.
 
+## License
+
+MIT — see [LICENSE](LICENSE).
+
 **Ready-made configs** are in [examples/](examples/) — from the three-line
 minimum to one that shows every setting at once.

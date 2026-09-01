@@ -4,8 +4,11 @@
 # Uploads a build over rsync/SSH into a timestamped release, switches the
 # current symlink atomically, prunes old releases, rolls back on failure.
 #
-# (c) Philip Stuessel
+# (c) 2026 Philip Stuessel
 # https://github.com/philipstuessel/deploy-machine
+#
+# For the full copyright and license information, please view the LICENSE
+# file that was distributed with this source code.
 #
 set -euo pipefail
 
