@@ -12,7 +12,7 @@
 #
 set -euo pipefail
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 
 usage() {
   printf 'deployMachine %s — deploy a directory to a server over rsync/SSH.\n' "$VERSION"
@@ -40,13 +40,15 @@ COMMANDS
   rollback             put current back one release, or onto a named one with
                        rollback="<release>". Nothing is uploaded, only the
                        symlink moves. A failing healthcheck_url afterwards does
-                       not undo it
+                       not undo it. Needs releases on the target, which only
+                       strategy="release" creates
   status               show the releases on the target, newest first: "cu" is
                        the one that is live, "re" one you can roll back to.
                        The name is the last field, so piping it through
-                       awk '{print $NF}' gives bare names. list= is the same
+                       awk '{print $NF}' gives bare names. list= is the same.
+                       Needs releases on the target, same as rollback
   ssh                  open a shell on the target, starting in the directory
-                       current points at, or in ssh="<dir>"
+                       current points at, in ssh="<dir>" or in ssh_path=
 
 SETTINGS
   json                 path to a config JSON, or inline JSON. Without "steps"
@@ -64,6 +66,10 @@ SETTINGS
                        then taken unverified via ssh-keyscan
   known_hosts_file     a known_hosts file to look the host up in; a leading ~/
                        is expanded. Aborts if the host is not in there
+  ssh_path             the directory an ssh session starts in, instead of
+                       current (release) or deploy_path (sync). Takes
+                       {{placeholders}}. "-" starts in the home directory and
+                       sends no command at all
   source               the local directory whose contents get uploaded (dist)
   deploy_path          the directory on the server to deploy into (required)
   strategy             release: upload into a new folder, then move a symlink,
@@ -93,7 +99,9 @@ STRATEGIES
   release  upload into releases/<release>, switch the current symlink
            atomically, then drop old releases. If a step fails after the
            switch, current is moved back to the previous release.
-  sync     rsync --delete straight into deploy_path.
+  sync     rsync --delete straight into deploy_path, which is mirrored:
+           files on the server that are not in source are removed. Keeps no
+           releases, so status and rollback have nothing to work on.
 
 STEP TYPES
   upload       from, to, delete, exclude[]
@@ -257,7 +265,7 @@ is_reserved() {
     json|host|user|port|ssh_key|ssh_key_file|known_hosts|known_hosts_file) return 0 ;;
     source|deploy_path|strategy|release|releases_dir|release_path|current_link) return 0 ;;
     keep_releases|healthcheck_url|rollback_on_failure|dry_run|deps_install) return 0 ;;
-    rollback|list|status|ssh|timestamp|ci_*|github_*) return 0 ;;
+    rollback|list|status|ssh|ssh_path|timestamp|ci_*|github_*) return 0 ;;
   esac
   return 1
 }
@@ -487,6 +495,11 @@ exit 0"
 }
 
 # --- rollback ---
+sync_hint() {
+  [ "$STRATEGY" = "release" ] && { printf ' — nothing deployed there yet.'; return 0; }
+  printf ' — strategy=sync deploys straight into %s and keeps no releases.' "$DEPLOY_PATH"
+}
+
 list_releases() { remote_capture "ls -1 $(shq "$(var_get releases_dir)") 2>/dev/null | sort -r"; }
 
 current_release() {
@@ -500,7 +513,7 @@ mode_status() {
   [ -t 1 ] && { lb=$C_LB; rst=$C_0; }
   cur=$(current_release)
   rels=$(list_releases)
-  [ -n "$rels" ] || die "no releases found in $(var_get releases_dir)"
+  [ -n "$rels" ] || die "no releases found in $(var_get releases_dir)$(sync_hint)"
   while IFS= read -r r; do
     [ -n "$r" ] || continue
     case "$r" in
@@ -522,16 +535,36 @@ mode_ssh() {
   dir=$(var_get ssh)
   case "$dir" in
     true|yes|on|1)
-      if [ "$STRATEGY" = "release" ]; then dir=$CURRENT_LINK; else dir=$DEPLOY_PATH; fi ;;
-    *) dir=$(render "$dir") ;;
+      dir=$(var_get ssh_path)
+      if [ -z "$dir" ]; then
+        if [ "$STRATEGY" = "release" ]; then dir=$CURRENT_LINK; else dir=$DEPLOY_PATH; fi
+      fi ;;
   esac
-  info "ssh $USR@$HOST → $dir"
+  case "$dir" in -|none) dir="" ;; *) dir=$(render "$dir") ;; esac
+  info "ssh $USR@$HOST${dir:+ → $dir}"
   if [ "$DRY_RUN" = "true" ]; then
-    dim "[dry-run] ssh -t ${SSH_ARGS[*]} $USR@$HOST cd $(shq "$dir") && exec \$SHELL -l"
+    if [ -n "$dir" ]; then
+      dim "[dry-run] ssh -t ${SSH_ARGS[*]} $USR@$HOST cd $(shq "$dir") ... exec \$SHELL -l|-i"
+    else
+      dim "[dry-run] ssh -t ${SSH_ARGS[*]} $USR@$HOST"
+    fi
     return 0
   fi
   set +e
-  ssh -t "${SSH_ARGS[@]}" "$USR@$HOST" "cd $(shq "$dir") || exit 1; exec \${SHELL:-/bin/sh} -l"
+  if [ -n "$dir" ]; then
+    ssh -t "${SSH_ARGS[@]}" "$USR@$HOST" "cd $(shq "$dir") || exit 1
+for s in \"\$SHELL\" /bin/bash /bin/sh; do
+  [ -x \"\$s\" ] || continue
+  for p in \"\$HOME/.bash_profile\" \"\$HOME/.bash_login\" \"\$HOME/.profile\"; do
+    [ -r \"\$p\" ] && exec \"\$s\" -l
+  done
+  exec \"\$s\" -i
+done
+echo 'no usable shell: tried \$SHELL, /bin/bash, /bin/sh' >&2
+exit 127"
+  else
+    ssh -t "${SSH_ARGS[@]}" "$USR@$HOST"
+  fi
   rc=$?
   set -e
   [ $rc -eq 255 ] && die "ssh connection to $USR@$HOST:$PORT failed."
@@ -543,7 +576,7 @@ mode_rollback() {
   want=$(var_get rollback)
   cur=$(current_release)
   rels=$(list_releases)
-  [ -n "$rels" ] || die "no releases found in $(var_get releases_dir) — rollback needs a strategy=release deployment."
+  [ -n "$rels" ] || die "no releases found in $(var_get releases_dir)$(sync_hint)"
   case "$want" in
     ''|true|previous)
       [ -n "$cur" ] || die "$CURRENT_LINK does not point at a release — pass rollback=\"<release>\"."
@@ -732,7 +765,8 @@ if [ "$MODE" = "deploy" ]; then
 else
   info "$MODE"
   dim "target     ${HOST:+$USR@$HOST:}$DEPLOY_PATH"
-  dim "releases   $(var_get releases_dir)"
+  dim "strategy   $STRATEGY"
+  if [ "$STRATEGY" = "release" ]; then dim "releases   $(var_get releases_dir)"; fi
 fi
 [ "$DRY_RUN" = "true" ] && warn "dry_run=true — nothing will be executed."
 

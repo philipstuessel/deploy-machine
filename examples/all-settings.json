@@ -6,6 +6,7 @@
     "port": "22",
     "ssh_key_file": "~/.ssh/deploy_key",
     "known_hosts_file": "~/.ssh/known_hosts",
+    "ssh_path": "{{current_link}}",
     "source": "dist",
     "deploy_path": "/srv/app",
     "strategy": "release",
