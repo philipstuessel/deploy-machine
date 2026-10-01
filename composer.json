@@ -1,0 +1,6 @@
+{
+    "name": "philipstuessel/deploy-machine",
+    "description": "Deploys a folder to a server. One bash script, one config file.",
+    "license": "MIT",
+    "bin": [".deploy/deployMachine.sh"]
+}

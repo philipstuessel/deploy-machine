@@ -12,7 +12,7 @@
 #
 set -euo pipefail
 
-VERSION="1.2.0"
+VERSION="1.2.1"
 
 usage() {
   printf 'deployMachine %s — deploy a directory to a server over rsync/SSH.\n' "$VERSION"

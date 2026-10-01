@@ -148,6 +148,9 @@ trying things out.
 **A deploy log** on the server: `log="true"` appends one line per deploy and
 rollback, with a timestamp, to `deploy.log` in `deploy_path`.
 
+**With Composer** it installs as a dev dependency and runs from
+`vendor/bin/deployMachine.sh` — see [COMPOSER.md](COMPOSER.md).
+
 **Every setting** is in `--help`. There are more than shown here, but you rarely
 need them.
 
