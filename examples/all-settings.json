@@ -17,6 +17,7 @@
     "healthcheck_url": "https://example.com",
     "rollback_on_failure": "true",
     "deps_install": "auto",
+    "log": "true",
     "dry_run": "false"
   },
   "steps": [

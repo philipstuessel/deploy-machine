@@ -12,7 +12,7 @@
 #
 set -euo pipefail
 
-VERSION="1.1.0"
+VERSION="1.2.0"
 
 usage() {
   printf 'deployMachine %s — deploy a directory to a server over rsync/SSH.\n' "$VERSION"
@@ -90,6 +90,12 @@ SETTINGS
                        current back on the previous release (true)
   dry_run              print every command instead of running it. Changes
                        nothing and never touches the network (false)
+  log                  true: append one line per deploy, rollback and failed
+                       deploy to {{deploy_path}}/deploy.log on the target,
+                       with the local time of the machine that deploys. Any
+                       other value is the path of the log file. With
+                       strategy="sync" it has to be a path outside
+                       deploy_path (false)
   deps_install         auto: install rsync, ssh, jq or curl through
                        apk/apt-get/dnf when one of them is missing, which is
                        what lets a bare CI container work. never: stop and say
@@ -264,7 +270,7 @@ is_reserved() {
   case "$1" in
     json|host|user|port|ssh_key|ssh_key_file|known_hosts|known_hosts_file) return 0 ;;
     source|deploy_path|strategy|release|releases_dir|release_path|current_link) return 0 ;;
-    keep_releases|healthcheck_url|rollback_on_failure|dry_run|deps_install) return 0 ;;
+    keep_releases|healthcheck_url|rollback_on_failure|dry_run|deps_install|log) return 0 ;;
     rollback|list|status|ssh|ssh_path|timestamp|ci_*|github_*) return 0 ;;
   esac
   return 1
@@ -380,6 +386,17 @@ remote_capture() {
   fi
 }
 
+LOG_FILE=""
+LOG_READY=false
+log_write() {
+  local line
+  [ -n "$LOG_FILE" ] || return 0
+  [ "$LOG_READY" = "true" ] || return 0
+  line="$(date '+%Y-%m-%d %H:%M:%S %z')  $1  by $(id -un 2>/dev/null || printf unknown)"
+  remote_exec "mkdir -p $(shq "$(dirname "$LOG_FILE")") && printf '%s\\n' $(shq "$line") >> $(shq "$LOG_FILE")" \
+    || warn "could not write to $LOG_FILE"
+}
+
 # --- steps ---
 STEP_I=0
 JSON_RAW=""
@@ -395,7 +412,7 @@ step_upload() {
   [ -n "$to" ] || die "upload step without \"to\"."
   [ -e "${from%/}" ] || { fail "source not found: ${from%/} (is the build artifact missing?)"; return; }
   ensure_tool rsync rsync
-  opts=(-a --human-readable)
+  opts=(-a --no-owner --no-group --human-readable)
   is_true "$(step_val delete)" delete && opts+=(--delete)
   while IFS= read -r ex; do
     [ -n "$ex" ] && opts+=(--exclude="$(render "$ex")")
@@ -486,7 +503,7 @@ step_cleanup() {
 cd $(shq "$dir") 2>/dev/null || exit 0
 cur=\$(readlink $(shq "$link") 2>/dev/null || true)
 cur=\$(basename \"\${cur:-none}\")
-ls -1 | sort -r | tail -n +$((keep + 1)) | while IFS= read -r r; do
+for r in *; do [ -d \"\$r\" ] && [ ! -L \"\$r\" ] && echo \"\$r\"; done | sort -r | tail -n +$((keep + 1)) | while IFS= read -r r; do
   [ \"\$r\" = \"\$cur\" ] && continue
   rm -rf -- \"\$r\" || { echo \"could not remove: \$r\" >&2; continue; }
   echo \"removed: \$r\"
@@ -500,7 +517,10 @@ sync_hint() {
   printf ' — strategy=sync deploys straight into %s and keeps no releases.' "$DEPLOY_PATH"
 }
 
-list_releases() { remote_capture "ls -1 $(shq "$(var_get releases_dir)") 2>/dev/null | sort -r"; }
+list_releases() {
+  remote_capture "cd $(shq "$(var_get releases_dir)") 2>/dev/null || exit 0
+for r in *; do [ -d \"\$r\" ] && [ ! -L \"\$r\" ] && echo \"\$r\"; done | sort -r"
+}
 
 current_release() {
   local t
@@ -594,6 +614,7 @@ mode_rollback() {
   fi
   info "rollback ${cur:-?} → $target"
   symlink_switch "$(var_get releases_dir)/$target" "$CURRENT_LINK"
+  log_write "rollback  ${cur:-?} -> $target"
   if [ -n "$(var_get healthcheck_url)" ]; then
     ensure_tool jq jq
     JSON_RAW='{"steps":[{"type":"healthcheck","url":"{{healthcheck_url}}"}]}'
@@ -719,19 +740,34 @@ DEPLOY_PATH=$(var_get deploy_path)
 RELEASE_PATH=$(var_get release_path)
 CURRENT_LINK=$(var_get current_link)
 
+case "$(printf '%s' "$(var_get log)" | tr 'A-Z' 'a-z')" in
+  ''|false|no|off|0) ;;
+  true|yes|on|1) LOG_FILE="$DEPLOY_PATH/deploy.log" ;;
+  *) LOG_FILE=$(render "$(var_get log)") ;;
+esac
+if [ -n "$LOG_FILE" ] && [ "$STRATEGY" = "sync" ]; then
+  case "$LOG_FILE" in "$DEPLOY_PATH"/*) die "log= points into deploy_path, where strategy=\"sync\" would delete it on every deploy — set log= to a path outside." ;; esac
+fi
+
 [ -n "$HOST" ] && [ -z "$USR" ] && die "user= is missing (host=\"$HOST\" was given)."
 case "$PORT" in ''|*[!0-9]*) die "port= must be a number, got: $PORT" ;; esac
 
 # --- main ---
 on_exit() {
-  local rc=$?
+  local rc=$? back=""
   trap - EXIT
   [ $rc -ne 0 ] && [ -n "$CURRENT_STEP" ] && step_stop "$CURRENT_STEP"
   if [ $rc -ne 0 ] && [ "$SWITCHED" = "true" ] && [ "$ROLLBACK_ON_FAILURE" = "true" ] && [ -n "$PREV_TARGET" ]; then
     warn "deploy failed — moving $CURRENT_LINK back to $PREV_TARGET"
-    symlink_switch "$PREV_TARGET" "$CURRENT_LINK" && warn "rollback done." || warn "rollback failed — please check manually."
+    if symlink_switch "$PREV_TARGET" "$CURRENT_LINK"; then
+      warn "rollback done."
+      back=", rolled back to ${PREV_TARGET##*/}"
+    else
+      warn "rollback failed — please check manually."
+    fi
   fi
   if [ $rc -ne 0 ] && [ "$MODE" = "deploy" ]; then
+    log_write "failed    $(var_get release)$back" || true
     warn "release $(var_get release) · symlink switched: $SWITCHED"
     if [ "$SWITCHED" = "true" ] && [ -z "$PREV_TARGET" ]; then
       warn "$CURRENT_LINK points at this failed release, and there is no earlier one to fall back to."
@@ -776,6 +812,8 @@ setup_ssh
   ssh "${SSH_ARGS[@]}" "$USR@$HOST" true 2>/dev/null || die "SSH connection to $USR@$HOST:$PORT failed."
 }
 
+LOG_READY=true
+
 case "$MODE" in
   status) mode_status; exit 0 ;;
   rollback) mode_rollback; exit 0 ;;
@@ -813,4 +851,5 @@ while [ "$STEP_I" -lt "$STEP_COUNT" ]; do
   STEP_I=$((STEP_I + 1))
 done
 
+log_write "deploy    $(var_get release)"
 ok "deploy finished: $(var_get release) → ${HOST:+$USR@$HOST:}$([ "$STRATEGY" = release ] && printf '%s' "$CURRENT_LINK" || printf '%s' "$DEPLOY_PATH")"

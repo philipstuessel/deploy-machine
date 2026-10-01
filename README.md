@@ -39,6 +39,9 @@ Every deploy creates a new folder, then moves one symlink:
 Going live is a symlink move, so it is instant. Going back is the same move in
 reverse — which is why a rollback takes no time at all, however big the project.
 
+`current` can also live inside `releases/` — see
+[examples/current-in-releases.json](examples/current-in-releases.json).
+
 ## The five commands
 
 ```bash
@@ -141,6 +144,9 @@ If it is not there, it asks the server — and tells you that this is unverified
 
 **Without `host`** it deploys locally with `rsync` into a folder. Handy for
 trying things out.
+
+**A deploy log** on the server: `log="true"` appends one line per deploy and
+rollback, with a timestamp, to `deploy.log` in `deploy_path`.
 
 **Every setting** is in `--help`. There are more than shown here, but you rarely
 need them.
