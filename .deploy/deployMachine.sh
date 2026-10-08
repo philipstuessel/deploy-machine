@@ -49,6 +49,8 @@ COMMANDS
                        Needs releases on the target, same as rollback
   ssh                  open a shell on the target, starting in the directory
                        current points at, in ssh="<dir>" or in ssh_path=
+  unlock               remove the lock a killed run left behind on the target.
+                       Only when you are sure that no deploy is running
 
 SETTINGS
   json                 path to a config JSON, or inline JSON. Without "steps"
@@ -96,6 +98,13 @@ SETTINGS
                        other value is the path of the log file. With
                        strategy="sync" it has to be a path outside
                        deploy_path (false)
+  lock                 true: hold {{deploy_path}}/.deploy.lock on the target
+                       while a deploy or rollback runs, so a second one stops
+                       instead of running into the first. Any other value is
+                       the path of the lock. false turns it off (true)
+  lock_timeout         minutes after which a lock counts as left behind by a
+                       run that died, and the next run takes it over. 0 never
+                       does (30)
   deps_install         auto: install rsync, ssh, jq or curl through
                        apk/apt-get/dnf when one of them is missing, which is
                        what lets a bare CI container work. never: stop and say
@@ -271,6 +280,7 @@ is_reserved() {
     json|host|user|port|ssh_key|ssh_key_file|known_hosts|known_hosts_file) return 0 ;;
     source|deploy_path|strategy|release|releases_dir|release_path|current_link) return 0 ;;
     keep_releases|healthcheck_url|rollback_on_failure|dry_run|deps_install|log) return 0 ;;
+    lock|lock_timeout|unlock) return 0 ;;
     rollback|list|status|ssh|ssh_path|timestamp|ci_*|github_*) return 0 ;;
   esac
   return 1
@@ -397,6 +407,81 @@ log_write() {
     || warn "could not write to $LOG_FILE"
 }
 
+# --- lock ---
+LOCK_DIR=""
+LOCK_TIMEOUT=0
+LOCK_TOKEN=""
+LOCK_HELD=false
+
+lock_age() {
+  case "$1" in
+    ''|*[!0-9]*) printf 'at an unknown time' ;;
+    *) if [ "$1" -lt 120 ]; then printf '%ss ago' "$1"; else printf '%s min ago' "$(($1 / 60))"; fi ;;
+  esac
+}
+
+lock_acquire() {
+  local what=$1 desc out state age who
+  [ -n "$LOCK_DIR" ] || return 0
+  if [ "$DRY_RUN" = "true" ]; then dim "[dry-run] lock $LOCK_DIR"; return 0; fi
+  LOCK_TOKEN="$(var_get timestamp)-$$-$RANDOM"
+  desc="$what by $(id -un 2>/dev/null || printf unknown)@$(hostname 2>/dev/null || printf unknown)"
+  out=$(remote_capture "l=$(shq "$LOCK_DIR")
+mkdir -p $(shq "$(dirname "$LOCK_DIR")") 2>/dev/null
+now=\$(date +%s)
+take() {
+  mkdir \"\$l\" 2>/dev/null || return 1
+  printf '%s\\n' \"\$now\" $(shq "$LOCK_TOKEN") $(shq "$desc") > \"\$l/info\" || { rm -rf \"\$l\"; return 1; }
+}
+if take; then echo acquired; exit 0; fi
+[ -d \"\$l\" ] || exit 0
+at=\$(sed -n 1p \"\$l/info\" 2>/dev/null)
+who=\$(sed -n 3p \"\$l/info\" 2>/dev/null)
+case \"\$at\" in ''|*[!0-9]*) age=- ;; *) age=\$((now - at)) ;; esac
+if [ \"\$age\" != - ] && [ $LOCK_TIMEOUT -gt 0 ] && [ \"\$age\" -ge $LOCK_TIMEOUT ]; then
+  rm -rf \"\$l\"
+  if take; then echo \"stale \$age \$who\"; exit 0; fi
+fi
+echo \"locked \$age \$who\"")
+  read -r state age who <<< "$out" || true
+  case "$state" in
+    acquired) ;;
+    stale) warn "took over a lock left behind $(lock_age "$age")${who:+: $who}" ;;
+    locked) die "locked $(lock_age "$age")${who:+: $who} — wait for it to finish, or run with unlock if that run is dead. ($LOCK_DIR)" ;;
+    *) die "could not create the lock $LOCK_DIR — is its directory writable? lock=\"false\" turns locking off." ;;
+  esac
+  LOCK_HELD=true
+}
+
+lock_release() {
+  local out
+  [ "$LOCK_HELD" = "true" ] || return 0
+  LOCK_HELD=false
+  out=$(remote_capture "l=$(shq "$LOCK_DIR")
+if [ \"\$(sed -n 2p \"\$l/info\" 2>/dev/null)\" = $(shq "$LOCK_TOKEN") ]; then rm -rf \"\$l\" && echo released; else echo foreign; fi")
+  case "$out" in
+    released) ;;
+    foreign) warn "the lock $LOCK_DIR is no longer this run's (taken over or unlocked) — left as it is." ;;
+    *) warn "could not remove the lock $LOCK_DIR — remove it with unlock." ;;
+  esac
+}
+
+mode_unlock() {
+  local out state who
+  [ -n "$LOCK_DIR" ] || die "lock= is off — there is nothing to unlock."
+  if [ "$DRY_RUN" = "true" ]; then dim "[dry-run] remove $LOCK_DIR"; return 0; fi
+  out=$(remote_capture "l=$(shq "$LOCK_DIR")
+[ -d \"\$l\" ] || { echo none; exit 0; }
+who=\$(sed -n 3p \"\$l/info\" 2>/dev/null)
+rm -rf \"\$l\" && echo \"removed \$who\"")
+  read -r state who <<< "$out" || true
+  case "$state" in
+    none) ok "no lock at $LOCK_DIR — nothing to do." ;;
+    removed) ok "lock removed${who:+ — it was held by: $who}" ;;
+    *) die "could not remove the lock $LOCK_DIR" ;;
+  esac
+}
+
 # --- steps ---
 STEP_I=0
 JSON_RAW=""
@@ -417,6 +502,7 @@ step_upload() {
   while IFS= read -r ex; do
     [ -n "$ex" ] && opts+=(--exclude="$(render "$ex")")
   done <<< "$(step_list exclude)"
+  case "$LOCK_DIR" in "${to%/}"/*) opts+=(--exclude="/${LOCK_DIR#"${to%/}"/}") ;; esac
   remote_exec "mkdir -p $(shq "${to%/}")"
   if [ -n "$HOST" ]; then
     run_cmd rsync "${opts[@]}" -e "ssh ${SSH_ARGS[*]}" "$from" "$USR@$HOST:$to"
@@ -517,6 +603,8 @@ sync_hint() {
   printf ' — strategy=sync deploys straight into %s and keeps no releases.' "$DEPLOY_PATH"
 }
 
+need_releases() { [ -n "$1" ] || die "no releases found in $(var_get releases_dir)$(sync_hint)"; }
+
 list_releases() {
   remote_capture "cd $(shq "$(var_get releases_dir)") 2>/dev/null || exit 0
 for r in *; do [ -d \"\$r\" ] && [ ! -L \"\$r\" ] && echo \"\$r\"; done | sort -r"
@@ -533,7 +621,7 @@ mode_status() {
   [ -t 1 ] && { lb=$C_LB; rst=$C_0; }
   cur=$(current_release)
   rels=$(list_releases)
-  [ -n "$rels" ] || die "no releases found in $(var_get releases_dir)$(sync_hint)"
+  need_releases "$rels"
   while IFS= read -r r; do
     [ -n "$r" ] || continue
     case "$r" in
@@ -596,7 +684,7 @@ mode_rollback() {
   want=$(var_get rollback)
   cur=$(current_release)
   rels=$(list_releases)
-  [ -n "$rels" ] || die "no releases found in $(var_get releases_dir)$(sync_hint)"
+  need_releases "$rels"
   case "$want" in
     ''|true|previous)
       [ -n "$cur" ] || die "$CURRENT_LINK does not point at a release — pass rollback=\"<release>\"."
@@ -689,8 +777,8 @@ for a in "$@"; do
       esac
       var_set "$arg_k" "$arg_v"
       ;;
-    ssh|list|status|rollback|dry_run) var_set "$a" "true"; ARG_KEYS="$ARG_KEYS $a" ;;
-    *) die "Arguments must look like key=\"value\"; the only bare words are ssh, list, status, rollback and dry_run — got: $a" ;;
+    ssh|list|status|rollback|unlock|dry_run) var_set "$a" "true"; ARG_KEYS="$ARG_KEYS $a" ;;
+    *) die "Arguments must look like key=\"value\"; the only bare words are ssh, list, status, rollback, unlock and dry_run — got: $a" ;;
   esac
 done
 
@@ -704,6 +792,8 @@ var_default keep_releases "5"
 var_default rollback_on_failure "true"
 var_default dry_run "false"
 var_default deps_install "auto"
+var_default lock "true"
+var_default lock_timeout "30"
 var_default timestamp "$(date -u +%Y%m%d%H%M%S)"
 for e in CI_COMMIT_SHA CI_COMMIT_SHORT_SHA CI_COMMIT_BRANCH CI_COMMIT_TAG CI_JOB_ID CI_PROJECT_NAME CI_PIPELINE_ID \
          GITHUB_SHA GITHUB_REF_NAME GITHUB_RUN_ID GITHUB_RUN_NUMBER GITHUB_REPOSITORY GITHUB_ACTOR; do
@@ -749,6 +839,14 @@ if [ -n "$LOG_FILE" ] && [ "$STRATEGY" = "sync" ]; then
   case "$LOG_FILE" in "$DEPLOY_PATH"/*) die "log= points into deploy_path, where strategy=\"sync\" would delete it on every deploy — set log= to a path outside." ;; esac
 fi
 
+case "$(printf '%s' "$(var_get lock)" | tr 'A-Z' 'a-z')" in
+  false|no|off|0) ;;
+  true|yes|on|1) LOCK_DIR="$DEPLOY_PATH/.deploy.lock" ;;
+  *) LOCK_DIR=$(render "$(var_get lock)") ;;
+esac
+case "$(var_get lock_timeout)" in ''|*[!0-9]*) die "lock_timeout= must be a number of minutes, got: $(var_get lock_timeout)" ;; esac
+LOCK_TIMEOUT=$(($(var_get lock_timeout) * 60))
+
 [ -n "$HOST" ] && [ -z "$USR" ] && die "user= is missing (host=\"$HOST\" was given)."
 case "$PORT" in ''|*[!0-9]*) die "port= must be a number, got: $PORT" ;; esac
 
@@ -774,6 +872,7 @@ on_exit() {
       warn "next: deploy a fix, or run with list=\"true\" to see what is on the server."
     fi
   fi
+  lock_release || true
   [ -n "$TMP_KEY" ] && rm -f "$TMP_KEY"
   [ -n "$TMP_HOSTS" ] && rm -f "$TMP_HOSTS"
   [ $rc -eq 0 ] || printf '%s\n' "${C_R}✗ aborted (exit $rc).${C_0}" >&2
@@ -786,6 +885,7 @@ is_true "$(var_get list)" list && MODE=status
 case "$(var_get rollback)" in ''|false|no) ;; *) MODE=rollback ;; esac
 case "$(var_get ssh)" in ''|false|no) ;; *) MODE=ssh ;; esac
 is_true "$(var_get status)" status && MODE=status
+is_true "$(var_get unlock)" unlock && MODE=unlock
 
 if [ "$MODE" = "deploy" ]; then
   if [ -z "$JSON_RAW" ] || ! printf '%s' "$JSON_RAW" | jq -e 'has("steps")' >/dev/null 2>&1; then
@@ -815,9 +915,15 @@ setup_ssh
 LOG_READY=true
 
 case "$MODE" in
+  deploy) lock_acquire "deploy $(var_get release)" ;;
+  rollback) need_releases "$(list_releases)"; lock_acquire "rollback" ;;
+esac
+
+case "$MODE" in
   status) mode_status; exit 0 ;;
   rollback) mode_rollback; exit 0 ;;
   ssh) mode_ssh; exit 0 ;;
+  unlock) mode_unlock; exit 0 ;;
 esac
 
 STEP_I=0

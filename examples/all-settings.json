@@ -18,6 +18,8 @@
     "rollback_on_failure": "true",
     "deps_install": "auto",
     "log": "true",
+    "lock": "true",
+    "lock_timeout": "30",
     "dry_run": "false"
   },
   "steps": [
