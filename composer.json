@@ -1,6 +1,6 @@
 {
     "name": "philipstuessel/deploy-machine",
-    "description": "Deploys a folder to a server. One bash script, one config file.",
+    "description": "Deploy any project to any server you can SSH into, and roll it back in a second. One bash script, one config file.",
     "license": "MIT",
     "bin": [".deploy/deployMachine.sh"]
 }
