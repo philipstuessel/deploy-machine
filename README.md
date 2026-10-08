@@ -1,6 +1,7 @@
 # deployMachine
 
-Deploys a folder to a server. One bash script, one config file, nothing else.
+Deploy any project to any server you can SSH into, and roll it back in a second.
+One bash script, one config file, nothing else.
 
 ```bash
 .deploy/deployMachine.sh json=".deploy/simple.json"
@@ -155,6 +156,9 @@ expires after `lock_timeout` minutes (30), or goes away with `unlock`.
 
 **With Composer** it installs as a dev dependency and runs from
 `vendor/bin/deployMachine.sh` — see [COMPOSER.md](COMPOSER.md).
+
+**With npm** it installs as a dev dependency and runs as
+`npx deploy-machine` — see [NPM.md](NPM.md).
 
 **Every setting** is in `--help`. There are more than shown here, but you rarely
 need them.
