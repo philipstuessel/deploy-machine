@@ -148,6 +148,11 @@ trying things out.
 **A deploy log** on the server: `log="true"` appends one line per deploy and
 rollback, with a timestamp, to `deploy.log` in `deploy_path`.
 
+**A lock** on the server keeps two deploys from running into each other: the
+second one stops and says who holds it. A lock that a killed run left behind
+expires after `lock_timeout` minutes (30), or goes away with `unlock`.
+`lock="false"` turns it off.
+
 **With Composer** it installs as a dev dependency and runs from
 `vendor/bin/deployMachine.sh` — see [COMPOSER.md](COMPOSER.md).
 
