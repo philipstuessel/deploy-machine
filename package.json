@@ -3,7 +3,14 @@
   "version": "1.3.0",
   "description": "Deploy any project to any server you can SSH into, and roll it back in a second. One bash script, one config file.",
   "license": "MIT",
-  "repository": "github:philipstuessel/deploy-machine",
-  "bin": ".deploy/deployMachine.sh",
-  "files": [".deploy/deployMachine.sh"]
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/philipstuessel/deploy-machine.git"
+  },
+  "bin": {
+    "deploy-machine": ".deploy/deployMachine.sh"
+  },
+  "files": [
+    ".deploy/deployMachine.sh"
+  ]
 }
