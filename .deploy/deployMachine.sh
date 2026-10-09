@@ -12,7 +12,7 @@
 #
 set -euo pipefail
 
-VERSION="1.3.0"
+VERSION="1.3.1"
 
 usage() {
   printf 'deployMachine %s — deploy any project to any server you can SSH into.\n' "$VERSION"

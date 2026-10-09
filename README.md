@@ -1,11 +1,41 @@
 # deployMachine
 
+[![npm](https://img.shields.io/npm/v/deploy-machine)](https://www.npmjs.com/package/deploy-machine)
+[![packagist](https://img.shields.io/packagist/v/philipstuessel/deploy-machine)](https://packagist.org/packages/philipstuessel/deploy-machine)
+[![license](https://img.shields.io/npm/l/deploy-machine)](LICENSE)
+[![PRs welcome](https://img.shields.io/badge/PRs-welcome-brightgreen)](https://github.com/philipstuessel/deploy-machine/pulls)
+
 Deploy any project to any server you can SSH into, and roll it back in a second.
 One bash script, one config file, nothing else.
 
 ```bash
 .deploy/deployMachine.sh json=".deploy/simple.json"
 ```
+
+## Install
+
+It is the same script either way — take it however your project already gets
+its tools.
+
+**npm**
+
+```bash
+npm install --save-dev deploy-machine
+```
+
+**Composer**
+
+```bash
+composer require --dev philipstuessel/deploy-machine
+```
+
+The commands in this README call it as `.deploy/deployMachine.sh`. Installed as
+a package, only that first word changes:
+
+| Installed with | call it as | more |
+|----------------|------------|------|
+| npm | `npx deploy-machine` | [NPM.md](NPM.md) |
+| Composer | `vendor/bin/deployMachine.sh` | [COMPOSER.md](COMPOSER.md) |
 
 ## The config
 
@@ -154,18 +184,12 @@ second one stops and says who holds it. A lock that a killed run left behind
 expires after `lock_timeout` minutes (30), or goes away with `unlock`.
 `lock="false"` turns it off.
 
-**With Composer** it installs as a dev dependency and runs from
-`vendor/bin/deployMachine.sh` — see [COMPOSER.md](COMPOSER.md).
-
-**With npm** it installs as a dev dependency and runs as
-`npx deploy-machine` — see [NPM.md](NPM.md).
-
 **Every setting** is in `--help`. There are more than shown here, but you rarely
 need them.
+
+**Ready-made configs** are in [examples/](examples/) — from the three-line
+minimum to one that shows every setting at once.
 
 ## License
 
 MIT — see [LICENSE](LICENSE).
-
-**Ready-made configs** are in [examples/](examples/) — from the three-line
-minimum to one that shows every setting at once.
