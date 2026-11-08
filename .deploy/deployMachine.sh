@@ -12,7 +12,7 @@
 #
 set -euo pipefail
 
-VERSION="1.3.1"
+VERSION="1.3.2"
 
 usage() {
   printf 'deployMachine %s — deploy any project to any server you can SSH into.\n' "$VERSION"
@@ -320,7 +320,44 @@ ensure_tool() {
 # --- ssh ---
 TMP_KEY=""
 TMP_HOSTS=""
+SSH_ERR=""
 SSH_ARGS=()
+SSH_TRIES=3
+
+# Only messages from before the login; afterwards the remote command may already have run
+ssh_conn_failed() {
+  case "$1" in
+    *"connect to host"*|*kex_exchange_identification*|*ssh_exchange_identification*|*"banner exchange"*|*"Could not resolve hostname"*) return 0 ;;
+  esac
+  # Closed during kex/auth (sshd MaxStartups); after the login ssh says "Connection to … closed"
+  printf '%s\n' "$1" | tr -d '\r' | grep -Eq '^Connection closed by [^ ]+ port [0-9]+$'
+}
+
+# ssh_try [-q] <ssh args...>: ssh with SSH_ARGS; retried only when the connection itself
+# failed (ssh's own errors go to SSH_ERR via -E, at INFO: ERROR omits a connection closed
+# before the banner). -q discards the remote command's stderr.
+ssh_try() {
+  local quiet=false i=1 rc msg
+  [ "${1:-}" = "-q" ] && { quiet=true; shift; }
+  while :; do
+    : > "$SSH_ERR"
+    rc=0
+    if $quiet; then
+      ssh -E "$SSH_ERR" -o LogLevel=INFO "${SSH_ARGS[@]}" "$@" 2>/dev/null || rc=$?
+    else
+      ssh -E "$SSH_ERR" -o LogLevel=INFO "${SSH_ARGS[@]}" "$@" || rc=$?
+    fi
+    [ "$rc" -eq 255 ] || return "$rc"
+    msg=$(cat "$SSH_ERR" 2>/dev/null || true)
+    [ -n "$msg" ] || return 255
+    printf '%s\n' "$msg" >&2
+    ssh_conn_failed "$msg" || return 255
+    [ "$i" -lt "$SSH_TRIES" ] || return 255
+    warn "SSH connection to $USR@$HOST:$PORT failed — retry $i/$((SSH_TRIES - 1)) in $((i * 2))s"
+    sleep $((i * 2))
+    i=$((i + 1))
+  done
+}
 
 setup_ssh() {
   [ -n "$HOST" ] || return 0
@@ -338,6 +375,7 @@ setup_ssh() {
   if [ -n "$keyfile" ] && [ ! -r "$keyfile" ]; then die "SSH key is not readable: $keyfile"; fi
 
   TMP_HOSTS=$(mktemp)
+  SSH_ERR=$(mktemp)
   local kh khfile khname
   kh=$(var_get known_hosts)
   khfile=$(var_get known_hosts_file)
@@ -382,15 +420,23 @@ run_cmd() {
 
 remote_exec() {
   if [ -n "$HOST" ]; then
-    run_cmd ssh "${SSH_ARGS[@]}" "$USR@$HOST" "$1"
+    dim "\$ $(compact ssh "${SSH_ARGS[@]}" "$USR@$HOST" "$1")"
+    [ "$DRY_RUN" = "true" ] && return 0
+    ssh_try "$USR@$HOST" "$1"
   else
     run_cmd sh -c "$1"
   fi
 }
 
+# remote_capture <cmd>: prints the command's stdout. The command's own exit code is
+# ignored as before; only an unreachable host fails it (255), so callers never mistake
+# a lost connection for an empty answer.
 remote_capture() {
   if [ -n "$HOST" ]; then
-    ssh "${SSH_ARGS[@]}" "$USR@$HOST" "$1" 2>/dev/null || true
+    local rc=0
+    ssh_try -q "$USR@$HOST" "$1" || rc=$?
+    [ "$rc" -eq 255 ] && return 255
+    return 0
   else
     sh -c "$1" 2>/dev/null || true
   fi
@@ -442,7 +488,8 @@ if [ \"\$age\" != - ] && [ $LOCK_TIMEOUT -gt 0 ] && [ \"\$age\" -ge $LOCK_TIMEOU
   rm -rf \"\$l\"
   if take; then echo \"stale \$age \$who\"; exit 0; fi
 fi
-echo \"locked \$age \$who\"")
+echo \"locked \$age \$who\"") \
+    || die "lost the SSH connection to $USR@$HOST while taking the lock $LOCK_DIR — nothing was changed."
   read -r state age who <<< "$out" || true
   case "$state" in
     acquired) ;;
@@ -458,7 +505,10 @@ lock_release() {
   [ "$LOCK_HELD" = "true" ] || return 0
   LOCK_HELD=false
   out=$(remote_capture "l=$(shq "$LOCK_DIR")
-if [ \"\$(sed -n 2p \"\$l/info\" 2>/dev/null)\" = $(shq "$LOCK_TOKEN") ]; then rm -rf \"\$l\" && echo released; else echo foreign; fi")
+if [ \"\$(sed -n 2p \"\$l/info\" 2>/dev/null)\" = $(shq "$LOCK_TOKEN") ]; then rm -rf \"\$l\" && echo released; else echo foreign; fi") || {
+    warn "could not reach $USR@$HOST to remove the lock $LOCK_DIR — remove it with unlock."
+    return 0
+  }
   case "$out" in
     released) ;;
     foreign) warn "the lock $LOCK_DIR is no longer this run's (taken over or unlocked) — left as it is." ;;
@@ -473,7 +523,8 @@ mode_unlock() {
   out=$(remote_capture "l=$(shq "$LOCK_DIR")
 [ -d \"\$l\" ] || { echo none; exit 0; }
 who=\$(sed -n 3p \"\$l/info\" 2>/dev/null)
-rm -rf \"\$l\" && echo \"removed \$who\"")
+rm -rf \"\$l\" && echo \"removed \$who\"") \
+    || die "could not reach $USR@$HOST — the lock $LOCK_DIR was not touched."
   read -r state who <<< "$out" || true
   case "$state" in
     none) ok "no lock at $LOCK_DIR — nothing to do." ;;
@@ -491,7 +542,7 @@ step_val() { local v; v=$(step_get "$1"); [ -n "$v" ] && render "$v" || printf '
 step_list() { jq_q -r --argjson i "$STEP_I" --arg f "$1" '(.steps[$i][$f] // [])[]'; }
 
 step_upload() {
-  local from to opts=() ex
+  local from to opts=() ex i=1 rc msg
   from=$(step_val from); to=$(step_val to)
   [ -n "$from" ] || die "upload step without \"from\"."
   [ -n "$to" ] || die "upload step without \"to\"."
@@ -505,7 +556,20 @@ step_upload() {
   case "$LOCK_DIR" in "${to%/}"/*) opts+=(--exclude="/${LOCK_DIR#"${to%/}"/}") ;; esac
   remote_exec "mkdir -p $(shq "${to%/}")"
   if [ -n "$HOST" ]; then
-    run_cmd rsync "${opts[@]}" -e "ssh ${SSH_ARGS[*]}" "$from" "$USR@$HOST:$to"
+    dim "\$ $(compact rsync "${opts[@]}" -e "ssh ${SSH_ARGS[*]}" "$from" "$USR@$HOST:$to")"
+    [ "$DRY_RUN" = "true" ] && return 0
+    while :; do
+      : > "$SSH_ERR"
+      rc=0
+      rsync "${opts[@]}" -e "ssh -E $SSH_ERR -o LogLevel=INFO ${SSH_ARGS[*]}" "$from" "$USR@$HOST:$to" || rc=$?
+      [ "$rc" -eq 0 ] && return 0
+      msg=$(cat "$SSH_ERR" 2>/dev/null || true)
+      [ -n "$msg" ] && printf '%s\n' "$msg" >&2
+      if ! ssh_conn_failed "$msg" || [ "$i" -ge "$SSH_TRIES" ]; then return "$rc"; fi
+      warn "SSH connection for the upload failed — retry $i/$((SSH_TRIES - 1)) in $((i * 2))s"
+      sleep $((i * 2))
+      i=$((i + 1))
+    done
   else
     run_cmd rsync "${opts[@]}" "$from" "$to"
   fi
@@ -518,13 +582,16 @@ PREV_TARGET=""
 symlink_switch() {
   local target=$1 link=$2
   remote_exec "set -e
-if [ ! -e $(shq "$target") ]; then echo 'switch target does not exist' >&2; exit 1; fi
-if [ -e $(shq "$link") ] && [ ! -L $(shq "$link") ]; then echo 'link exists and is not a symlink' >&2; exit 1; fi
-ln -sfn $(shq "$target") $(shq "$link.tmp")
-mv -Tf $(shq "$link.tmp") $(shq "$link") 2>/dev/null \
-  || mv -hf $(shq "$link.tmp") $(shq "$link") 2>/dev/null \
-  || { rm -f $(shq "$link.tmp"); ln -sfn $(shq "$target") $(shq "$link"); }
-[ \"\$(readlink $(shq "$link"))\" = $(shq "$target") ] || { echo 'symlink does not point at the new target' >&2; exit 1; }"
+t=$(shq "$target"); l=$(shq "$link")
+if [ ! -e \"\$t\" ]; then echo 'switch target does not exist' >&2; exit 1; fi
+if [ -e \"\$l\" ] && [ ! -L \"\$l\" ]; then echo 'link exists and is not a symlink' >&2; exit 1; fi
+case \"\$t\" in /*) ;; *) t=\$(CDPATH= cd -- \"\$(dirname -- \"./\$t\")\" && pwd)/\$(basename -- \"\$t\") ;; esac
+ln -sfn \"\$t\" \"\$l.tmp\"
+mv -Tf \"\$l.tmp\" \"\$l\" 2>/dev/null \
+  || mv -hf \"\$l.tmp\" \"\$l\" 2>/dev/null \
+  || { rm -f \"\$l.tmp\"; ln -sfn \"\$t\" \"\$l\"; }
+[ \"\$(readlink \"\$l\")\" = \"\$t\" ] || { echo 'symlink does not point at the new target' >&2; exit 1; }
+[ -e \"\$l\" ] || { echo 'symlink does not resolve' >&2; exit 1; }"
 }
 
 step_symlink() {
@@ -533,7 +600,10 @@ step_symlink() {
   link=$(step_val link "$CURRENT_LINK")
   if [ "$link" = "$CURRENT_LINK" ]; then
     if [ "$DRY_RUN" != "true" ]; then
-      PREV_TARGET=$(remote_capture "readlink $(shq "$link") 2>/dev/null || true")
+      PREV_TARGET=$(remote_capture "readlink $(shq "$link") 2>/dev/null || true") || {
+        fail "could not read $link over SSH — not switching, so the release that is live stays live."
+        return 1
+      }
       case "$PREV_TARGET" in *"$NL"*) PREV_TARGET="" ;; esac
     fi
     SWITCHED=true
@@ -566,7 +636,7 @@ step_healthcheck() {
   i=1
   while [ "$i" -le "$retries" ]; do
     if [ "$on" = "remote" ]; then
-      code=$(remote_capture "curl -sS -o /dev/null -w '%{http_code}' --max-time $(shq "$timeout") $(shq "$url")")
+      code=$(remote_capture "curl -sS -o /dev/null -w '%{http_code}' --max-time $(shq "$timeout") $(shq "$url")") || code=""
     else
       code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time "$timeout" "$url" 2>/dev/null || true)
     fi
@@ -607,12 +677,14 @@ need_releases() { [ -n "$1" ] || die "no releases found in $(var_get releases_di
 
 list_releases() {
   remote_capture "cd $(shq "$(var_get releases_dir)") 2>/dev/null || exit 0
-for r in *; do [ -d \"\$r\" ] && [ ! -L \"\$r\" ] && echo \"\$r\"; done | sort -r"
+for r in *; do [ -d \"\$r\" ] && [ ! -L \"\$r\" ] && echo \"\$r\"; done | sort -r" \
+    || die "could not list the releases — SSH connection to $USR@$HOST failed."
 }
 
 current_release() {
   local t
-  t=$(remote_capture "readlink $(shq "$CURRENT_LINK") 2>/dev/null || true")
+  t=$(remote_capture "readlink $(shq "$CURRENT_LINK") 2>/dev/null || true") \
+    || die "could not read $CURRENT_LINK — SSH connection to $USR@$HOST failed."
   printf '%s' "${t##*/}"
 }
 
@@ -875,6 +947,7 @@ on_exit() {
   lock_release || true
   [ -n "$TMP_KEY" ] && rm -f "$TMP_KEY"
   [ -n "$TMP_HOSTS" ] && rm -f "$TMP_HOSTS"
+  [ -n "$SSH_ERR" ] && rm -f "$SSH_ERR"
   [ $rc -eq 0 ] || printf '%s\n' "${C_R}✗ aborted (exit $rc).${C_0}" >&2
   exit $rc
 }
@@ -909,14 +982,14 @@ fi
 [ "$MODE" = "deploy" ] && preflight
 setup_ssh
 [ -n "$HOST" ] && [ "$DRY_RUN" != "true" ] && [ "$MODE" != "ssh" ] && {
-  ssh "${SSH_ARGS[@]}" "$USR@$HOST" true 2>/dev/null || die "SSH connection to $USR@$HOST:$PORT failed."
+  ssh_try -q "$USR@$HOST" true || die "SSH connection to $USR@$HOST:$PORT failed."
 }
 
 LOG_READY=true
 
 case "$MODE" in
   deploy) lock_acquire "deploy $(var_get release)" ;;
-  rollback) need_releases "$(list_releases)"; lock_acquire "rollback" ;;
+  rollback) RELS=$(list_releases); need_releases "$RELS"; lock_acquire "rollback" ;;
 esac
 
 case "$MODE" in
